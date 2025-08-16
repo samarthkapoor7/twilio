@@ -2,35 +2,48 @@ import express from "express";
 import twilio from "twilio";
 import aiService from "../services/aiService.js";
 import callStateManager from "../services/callStateManager.js";
+import DeepgramSTTService from "../services/deepgramSTT.js";
+import dotenv from "dotenv";
+dotenv.config();
 
 const router = express.Router();
 const VoiceResponse = twilio.twiml.VoiceResponse;
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+const sttService = new DeepgramSTTService(process.env.DEEPGRAM_API_KEY);
 
 router.post("/voice", async (req, res) => {
   const callSid = req.body.CallSid;
   const from = req.body.From;
   const twiml = new VoiceResponse();
 
-  console.log(`📞 Incoming call from ${from}, CallSid: ${callSid}`);
-  callStateManager.initializeCall(callSid, from);
+  if (!callStateManager.getCallState(callSid)) {
+    callStateManager.initializeCall(callSid, from);
+    console.log(`📞 Incoming call from ${from}, CallSid: ${callSid}`);
+    twiml.say(
+      { voice: "Polly.Amy-Neural", language: "en-US" },
+      "Hello! How can I help you today?"
+    );
+  }
 
   try {
-    const gather = twiml.gather({
-      input: "speech",
-      action: `/twilio/handle-speech/${callSid}`,
-      method: "POST",
-      speechTimeout: "auto",
-      language: "en-US",
+    console.log(`🎤 Listening for user input (recording started) for CallSid: ${callSid}`);
+    twiml.record({
+      action: `${process.env.BASE_URL}/twilio/process-audio`,
+      method: 'POST',
+      maxLength: 30,
+      playBeep: true,
+      trim: 'trim-silence',
+      recordingStatusCallback: `${process.env.BASE_URL}/twilio/recording-status`,
+      recordingStatusCallbackMethod: 'POST'
     });
-
-    gather.say(
+    twiml.say(
       { voice: "Polly.Amy-Neural", language: "en-US" },
-      "Hello! I'm your AI assistant. How can I help you today?"
+      "I didn't hear anything. Please try again."
     );
-
-    // ❌ DO NOT redirect again — avoid loop!
-    // twiml.redirect(`/twilio/voice`)
-
+    twiml.redirect('/twilio/voice');
     res.type("text/xml").send(twiml.toString());
   } catch (error) {
     console.error("❌ Error in /voice:", error);
@@ -40,58 +53,95 @@ router.post("/voice", async (req, res) => {
   }
 });
 
-// ✅ Handle speech result
-router.post("/handle-speech/:callSid", async (req, res) => {
-  const callSid = req.params.callSid;
-  const speechResult = req.body.SpeechResult?.trim();
-  const twiml = new VoiceResponse();
-
-  try {
-    console.log(`🗣️ Speech received for ${callSid}: ${speechResult}`);
-
-    if (!speechResult) {
-      twiml.say("Sorry, I didn't catch that. Please try again.");
-      twiml.redirect(`/twilio/voice`);
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    callStateManager.addMessage(callSid, "user", speechResult);
-
-    const aiResponse = await aiService.processMessage(callSid, speechResult);
-    callStateManager.addMessage(callSid, "assistant", aiResponse);
-
-    const gather = twiml.gather({
-      input: "speech",
-      action: `/twilio/handle-speech/${callSid}`,
-      method: "POST",
-      speechTimeout: "auto",
-      language: "en-US",
-    });
-
-    gather.say({ voice: "Polly.Amy-Neural", language: "en-US" }, aiResponse);
-    twiml.redirect(`/twilio/voice`);
-
-    res.type("text/xml").send(twiml.toString());
-  } catch (error) {
-    console.error("❌ Error in /handle-speech:", error);
-    twiml.say("An error occurred. Goodbye.");
-    twiml.hangup();
-    res.type("text/xml").send(twiml.toString());
-  }
-});
-
-// ✅ Handle call status updates
 router.post("/status", (req, res) => {
   const callSid = req.body.CallSid;
   const status = req.body.CallStatus;
-
-  console.log(`📊 Status update for ${callSid}: ${status}`);
-
   if (["completed", "failed", "busy", "no-answer"].includes(status)) {
     callStateManager.endCall(callSid);
+    console.log(`📞 Call ended: ${callSid} (status: ${status})`);
   }
-
   res.status(200).send("OK");
 });
+
+router.post("/process-audio", async (req, res) => {
+  const { CallSid: callSid, RecordingUrl: recordingUrl, RecordingDuration: recordingDuration } = req.body;
+  if (!recordingUrl || recordingDuration <= 0) {
+    const twiml = new VoiceResponse();
+    twiml.say("I didn't receive any audio. Please try again.");
+    twiml.redirect('/twilio/voice');
+    return res.type("text/xml").send(twiml.toString());
+  }
+  try {
+    const transcript = await processAudioWithDeepgram(recordingUrl, callSid);
+    if (transcript?.trim()) {
+      console.log(`📝 Transcription received for CallSid ${callSid}: "${transcript}"`);
+      const lowerTranscript = transcript.toLowerCase();
+      if (lowerTranscript.includes('goodbye') || lowerTranscript.includes('bye') || 
+          lowerTranscript.includes('end call') || lowerTranscript.includes('hang up') ||
+          lowerTranscript.includes('that\'s all') || lowerTranscript.includes('nothing else')) {
+        console.log(`👋 User ended the call (goodbye detected) for CallSid: ${callSid}`);
+        const twiml = new VoiceResponse();
+        twiml.say("Thank you for calling! Have a great day. Goodbye!");
+        twiml.hangup();
+        return res.type("text/xml").send(twiml.toString());
+      }
+      callStateManager.addMessage(callSid, "user", transcript);
+      const aiResponse = await aiService.processMessage(callSid, transcript);
+      console.log(`🤖 AI response for CallSid ${callSid}: "${aiResponse}"`);
+      callStateManager.addMessage(callSid, "assistant", aiResponse);
+      const twiml = new VoiceResponse();
+      twiml.say(aiResponse);
+      twiml.redirect('/twilio/voice');
+      return res.type("text/xml").send(twiml.toString());
+    } else {
+      const twiml = new VoiceResponse();
+      twiml.say("I couldn't understand what you said. Please try speaking more clearly.");
+      twiml.redirect('/twilio/voice');
+      return res.type("text/xml").send(twiml.toString());
+    }
+  } catch (error) {
+    console.error(`❌ Error processing audio for CallSid ${callSid}:`, error);
+    const twiml = new VoiceResponse();
+    twiml.say("I'm sorry, I encountered an error processing your audio. Please try again.");
+    twiml.redirect('/twilio/voice');
+    return res.type("text/xml").send(twiml.toString());
+  }
+});
+
+router.post("/recording-status", (req, res) => {
+  res.status(200).send("OK");
+});
+
+async function processAudioWithDeepgram(audioUrl, callSid) {
+  try {
+    const recordingSid = audioUrl.split('/').pop();
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    let audioBuffer = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const recording = await twilioClient.recordings(recordingSid).fetch();
+        const mediaUrl = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
+        const response = await fetch(mediaUrl, {
+          headers: {
+            'Authorization': `Basic ${Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')}`
+          }
+        });
+        if (response.ok) {
+          audioBuffer = await response.arrayBuffer();
+          break;
+        }
+      } catch (error) {
+        if (attempt === 3) throw error;
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+    if (!audioBuffer) {
+      throw new Error('Failed to download audio');
+    }
+    return await sttService.transcribeAudio(audioBuffer, callSid);
+  } catch (error) {
+    throw error;
+  }
+}
 
 export default router;
