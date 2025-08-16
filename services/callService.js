@@ -1,49 +1,55 @@
-import twilio from "twilio"
-import dotenv from "dotenv"
+import twilio from "twilio";
+import dotenv from "dotenv";
+dotenv.config();
 
-dotenv.config()
-
-const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
 class CallService {
   async initiateCall(phoneNumber, initialMessage = null) {
+    const webhookUrl = process.env.TWILIO_WEBHOOK_URL || `${process.env.BASE_URL}/twilio/voice`;
+    const statusUrl = process.env.TWILIO_STATUS_URL || `${process.env.BASE_URL}/twilio/status`;
+
+    if (webhookUrl.includes('localhost') || webhookUrl.includes('127.0.0.1')) {
+      throw new Error('Twilio cannot use localhost URLs. Please use a public HTTPS URL.');
+    }
+    if (statusUrl.includes('localhost') || statusUrl.includes('127.0.0.1')) {
+      throw new Error('Twilio cannot use localhost URLs for status callbacks. Please use a public HTTPS URL.');
+    }
+
     try {
-      const call = await client.calls.create({
+      return await client.calls.create({
+        url: webhookUrl,
+        method: "POST",
         to: phoneNumber,
         from: process.env.TWILIO_PHONE_NUMBER,
-        url: `${process.env.BASE_URL}/twilio/voice`,
-        statusCallback: `${process.env.BASE_URL}/twilio/status`,
-        statusCallbackMethod: "POST",
+        statusCallback: statusUrl,
         statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-      })
-
-      console.log(`📞 Call initiated: ${call.sid} to ${phoneNumber}`)
-      return call
+        statusCallbackMethod: "POST",
+      });
     } catch (error) {
-      console.error("Error initiating call:", error)
-      throw error
+      throw error;
     }
   }
 
   async endCall(callSid) {
     try {
-      await client.calls(callSid).update({ status: "completed" })
-      console.log(`📞 Call ended: ${callSid}`)
+      await client.calls(callSid).update({ status: "completed" });
     } catch (error) {
-      console.error("Error ending call:", error)
-      throw error
+      throw error;
     }
   }
 
   async getCallStatus(callSid) {
     try {
-      const call = await client.calls(callSid).fetch()
-      return call.status
+      const call = await client.calls(callSid).fetch();
+      return call.status;
     } catch (error) {
-      console.error("Error getting call status:", error)
-      throw error
+      throw error;
     }
   }
 }
 
-export default new CallService()
+export default new CallService();

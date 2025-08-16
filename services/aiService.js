@@ -12,35 +12,24 @@ class AIService {
 
   async processMessage(callSid, userMessage) {
     try {
-      // Get conversation history
       const messages = callStateManager.getMessages(callSid);
-
-      // Build conversation context
-      const conversationHistory = messages.map((msg) => ({
+      const conversationHistory = messages.map(msg => ({
         role: msg.role,
         content: msg.content,
       }));
+      conversationHistory.push({ role: "user", content: userMessage });
 
-      // Add current user message
-      conversationHistory.push({
-        role: "user",
-        content: userMessage,
-      });
-
-      // Generate AI response
       const { text } = await generateText({
         model: openai("gpt-4o"),
         system: this.systemPrompt,
         messages: conversationHistory,
-        maxTokens: 100, // reduced
+        maxTokens: 100,
         temperature: 0.6,
-        timeout: 5000, // 👈 wrap in timeout wrapper if needed
+        timeout: 5000,
       });
 
-      console.log(`🤖 AI Response for call ${callSid}: ${text}`);
       return text;
     } catch (error) {
-      console.error("Error processing AI message:", error);
       return "I'm sorry, I didn't catch that. Could you please repeat?";
     }
   }
@@ -54,10 +43,8 @@ class AIService {
         maxTokens: 50,
         temperature: 0.8,
       });
-
       return text;
     } catch (error) {
-      console.error("Error generating initial message:", error);
       return "Hello! I'm your AI assistant. How can I help you today?";
     }
   }
